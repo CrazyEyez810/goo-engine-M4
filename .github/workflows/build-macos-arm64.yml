@@ -1,0 +1,141 @@
+# Builds Goo Engine for Apple Silicon Macs (M1/M2/M3/M4) and packages it as a .dmg.
+#
+# The binary is built on GitHub's arm64 macOS runner and runs natively on any
+# Apple Silicon Mac. Precompiled libraries, add-ons and the essentials asset
+# bundle are fetched from projects.blender.org at the revision matching the
+# upstream Blender main merged into this branch (see LIB_DATE).
+
+name: Build macOS (Apple Silicon)
+
+on:
+  workflow_dispatch:
+    inputs:
+      lib_ref:
+        description: "lib-macos_arm64 git ref to use (empty = last commit before LIB_DATE)"
+        required: false
+        default: ""
+  push:
+    branches:
+      - "claude/macos-arm64-build"
+
+env:
+  # Date of the last upstream Blender main merge (2024-01-30, Blender 4.1 alpha).
+  LIB_DATE: "2024-01-31"
+  # Allow old cmake_minimum_required() in bundled code with CMake 4.x.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 360
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          path: blender
+          fetch-depth: 1
+
+      - name: Select Xcode
+        run: |
+          for v in 15.4 15.3 15.2; do
+            if [ -d "/Applications/Xcode_${v}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${v}.app"
+              break
+            fi
+          done
+          xcodebuild -version
+          clang --version
+          cmake --version
+
+      - name: Install build tools
+        run: brew install ninja || true
+
+      - name: Fetch precompiled libraries
+        run: |
+          set -euo pipefail
+          LIBDIR="$GITHUB_WORKSPACE/lib/darwin_arm64"
+          GIT_LFS_SKIP_SMUDGE=1 git clone --filter=blob:none --no-checkout \
+            https://projects.blender.org/blender/lib-macos_arm64.git "$LIBDIR"
+          cd "$LIBDIR"
+          REF="${{ github.event.inputs.lib_ref }}"
+          if [ -z "$REF" ]; then
+            REF="$(git rev-list -1 --before="$LIB_DATE" origin/main || true)"
+          fi
+          if [ -z "$REF" ]; then
+            echo "No library commit before $LIB_DATE, falling back to blender-v4.1-release"
+            REF="origin/blender-v4.1-release"
+          fi
+          GIT_LFS_SKIP_SMUDGE=1 git checkout --quiet "$REF"
+          git log -1 --format="Using libraries: %H %cd %s"
+          git lfs pull
+          du -sh "$LIBDIR"
+          echo "LIBDIR=$LIBDIR" >> "$GITHUB_ENV"
+
+      - name: Fetch add-ons
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          for repo in addons addons-contrib; do
+            dest="$GITHUB_WORKSPACE/blender/scripts/${repo/-/_}"
+            git clone --filter=blob:none --no-checkout \
+              "https://projects.blender.org/blender/blender-${repo}.git" "$dest"
+            ref="$(git -C "$dest" rev-list -1 --before="$LIB_DATE" origin/main)"
+            git -C "$dest" checkout --quiet "$ref"
+            git -C "$dest" log -1 --format="Using $repo: %H %cd"
+          done
+
+      - name: Fetch essentials asset bundle
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          dest="$GITHUB_WORKSPACE/lib/assets"
+          GIT_LFS_SKIP_SMUDGE=1 git clone --filter=blob:none --no-checkout \
+            https://projects.blender.org/blender/blender-assets.git "$dest"
+          ref="$(git -C "$dest" rev-list -1 --before="$LIB_DATE" origin/main || true)"
+          [ -n "$ref" ] || ref="origin/blender-v4.1-release"
+          GIT_LFS_SKIP_SMUDGE=1 git -C "$dest" checkout --quiet "$ref"
+          git -C "$dest" lfs pull
+          git -C "$dest" log -1 --format="Using assets: %H %cd"
+
+      - name: Configure
+        run: |
+          cmake -S blender -B build -G Ninja \
+            -C blender/build_files/cmake/config/blender_release.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DLIBDIR="$LIBDIR"
+
+      - name: Build
+        run: |
+          # The runner has 3 cores and 7 GB RAM.
+          ninja -C build -j3 install
+
+      - name: Sign (ad-hoc) and package
+        run: |
+          set -euo pipefail
+          APP="build/bin/Blender.app"
+          test -d "$APP"
+          # Every Mach-O file must carry a valid signature to run on Apple Silicon.
+          find "$APP" -type f \( -perm -u+x -o -name "*.dylib" -o -name "*.so" \) -print0 |
+            while IFS= read -r -d '' f; do
+              if file "$f" | grep -q "Mach-O"; then
+                codesign --force --sign - "$f"
+              fi
+            done
+          codesign --force --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          "$APP/Contents/MacOS/Blender" --background --factory-startup --python-expr "import bpy; print('Version:', bpy.app.version_string)"
+
+          mkdir -p dmg
+          cp -R "$APP" "dmg/Goo Engine.app"
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "Goo Engine" -srcfolder dmg -ov -format UDZO \
+            "GooEngine-macos-arm64.dmg"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: GooEngine-macos-arm64
+          path: GooEngine-macos-arm64.dmg
+          retention-days: 30
+          compression-level: 0
